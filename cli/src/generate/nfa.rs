@@ -7,9 +7,8 @@ use std::mem::swap;
 use std::ops::Range;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum CharacterSet {
-    Include(Vec<char>),
-    Exclude(Vec<char>),
+pub struct CharacterSet {
+    ranges: Vec<Range<u32>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -54,130 +53,230 @@ impl Default for Nfa {
 
 impl CharacterSet {
     pub fn empty() -> Self {
-        CharacterSet::Include(Vec::new())
+        CharacterSet { ranges: Vec::new() }
+    }
+
+    pub fn all() -> Self {
+        CharacterSet {
+            ranges: vec![0..u32::MAX],
+        }
     }
 
     pub fn negate(self) -> CharacterSet {
-        match self {
-            CharacterSet::Include(chars) => CharacterSet::Exclude(chars),
-            CharacterSet::Exclude(chars) => CharacterSet::Include(chars),
+        let mut previous_end = 0;
+        let mut i = 0;
+        while i < self.ranges.len() {
+            let range = &mut self.ranges[i];
+            range.end = range.start;
+            range.start = previous_end;
+            previous_end = range.end;
+            if range.start == range.end {
+                self.ranges.remove(i);
+            } else {
+                i += 1;
+            }
         }
+        if previous_end < u32::MAX {
+            self.ranges.push(previous_end..u32::MAX);
+        }
+        self
     }
 
     pub fn add_char(self, c: char) -> Self {
-        if let CharacterSet::Include(mut chars) = self {
-            if let Err(i) = chars.binary_search(&c) {
-                chars.insert(i, c);
-            }
-            CharacterSet::Include(chars)
-        } else {
-            panic!("Called add with a negated character set");
-        }
+        self.add_int_range(0, c as u32, c as u32 + 1);
+        self
     }
 
     pub fn add_range(self, start: char, end: char) -> Self {
-        if let CharacterSet::Include(mut chars) = self {
-            let mut c = start as u32;
-            while c <= end as u32 {
-                chars.push(char::from_u32(c).unwrap());
-                c += 1;
-            }
-            chars.sort_unstable();
-            chars.dedup();
-            CharacterSet::Include(chars)
-        } else {
-            panic!("Called add with a negated character set");
-        }
+        self.add_int_range(0, start as u32, end as u32);
+        self
     }
 
     pub fn add(self, other: &CharacterSet) -> Self {
-        match self {
-            CharacterSet::Include(mut chars) => match other {
-                CharacterSet::Include(other_chars) => {
-                    chars.extend(other_chars);
-                    chars.sort_unstable();
-                    chars.dedup();
-                    CharacterSet::Include(chars)
-                }
-                CharacterSet::Exclude(other_chars) => {
-                    let excluded_chars = other_chars
-                        .iter()
-                        .cloned()
-                        .filter(|c| !chars.contains(&c))
-                        .collect();
-                    CharacterSet::Exclude(excluded_chars)
-                }
-            },
-            CharacterSet::Exclude(mut chars) => match other {
-                CharacterSet::Include(other_chars) => {
-                    chars.retain(|c| !other_chars.contains(&c));
-                    CharacterSet::Exclude(chars)
-                }
-                CharacterSet::Exclude(other_chars) => {
-                    chars.retain(|c| other_chars.contains(&c));
-                    CharacterSet::Exclude(chars)
-                }
-            },
+        let mut index = 0;
+        for range in &other.ranges {
+            index = self.add_int_range(index, range.start as u32, range.end as u32);
         }
+        self
+    }
+
+    fn add_int_range(self, mut i: usize, start: u32, end: u32) -> usize {
+        while i < self.ranges.len() {
+            let range = &mut self.ranges[i];
+            if range.start > end {
+                self.ranges.insert(i, start..end);
+                return i;
+            }
+            if range.end >= start {
+                range.end = range.end.max(end);
+                range.start = range.start.min(start);
+                return i;
+            }
+            i += 1;
+        }
+        self.ranges.push(start..end);
+        i
+    }
+
+    fn remove_int_range(self, start: u32, end: u32) -> usize {
+        let mut i = 0;
+        while i < self.ranges.len() {
+            let range = &mut self.ranges[i];
+            if range.start > end {
+                break;
+            }
+            if range.end > start {
+                if range.end > end {
+                    let new_range = range.start..start;
+                    range.start = end;
+                    self.ranges.insert(i, new_range);
+                } else {
+                    range.end = start;
+                }
+            }
+            i += 1;
+        }
+        i
     }
 
     pub fn does_intersect(&self, other: &CharacterSet) -> bool {
-        match self {
-            CharacterSet::Include(chars) => match other {
-                CharacterSet::Include(other_chars) => compare_chars(chars, other_chars).common,
-                CharacterSet::Exclude(other_chars) => compare_chars(chars, other_chars).left_only,
-            },
-            CharacterSet::Exclude(chars) => match other {
-                CharacterSet::Include(other_chars) => compare_chars(chars, other_chars).right_only,
-                CharacterSet::Exclude(_) => true,
-            },
+        let mut left_ranges = self.ranges.iter();
+        let mut right_ranges = other.ranges.iter();
+        let mut left_range = left_ranges.next();
+        let mut right_range = right_ranges.next();
+        while let (Some(left), Some(right)) = (&left_range, &right_range) {
+            if left.end <= right.start {
+                left_range = left_ranges.next();
+            } else if left.start >= right.end {
+                right_range = right_ranges.next();
+            } else {
+                return true;
+            }
         }
+        false
     }
 
     pub fn remove_intersection(&mut self, other: &mut CharacterSet) -> CharacterSet {
-        match self {
-            CharacterSet::Include(chars) => match other {
-                CharacterSet::Include(other_chars) => {
-                    CharacterSet::Include(remove_chars(chars, other_chars, true))
+        let mut intersection = Vec::new();
+        let mut left_i = 0;
+        let mut right_i = 0;
+        while left_i < self.ranges.len() && right_i < other.ranges.len() {
+            let left = &mut self.ranges[left_i];
+            let right = &mut self.ranges[right_i];
+
+            match left.start.cmp(&right.start) {
+                Ordering::Less => {
+                    // [ L ]
+                    //     [ R ]
+                    if left.end <= right.start {
+                        left_i += 1;
+                        continue;
+                    }
+
+                    match left.end.cmp(&right.end) {
+                        // [ L ]
+                        //   [ R ]
+                        Ordering::Less => {
+                            intersection.push(right.start..left.end);
+                            left.end = right.start;
+                            right.start = left.end;
+                            left_i += 1;
+                        }
+
+                        // [  L  ]
+                        //   [ R ]
+                        Ordering::Equal => {
+                            intersection.push(right.clone());
+                            left.end = right.start;
+                            other.ranges.remove(right_i);
+                        }
+
+                        // [   L   ]
+                        //   [ R ]
+                        Ordering::Greater => {
+                            intersection.push(right.clone());
+                            let new_range = left.start..right.start;
+                            left.start = right.end;
+                            self.ranges.insert(left_i, new_range);
+                            left_i += 1;
+                        }
+                    }
                 }
-                CharacterSet::Exclude(other_chars) => {
-                    let mut removed = remove_chars(chars, other_chars, false);
-                    add_chars(other_chars, chars);
-                    swap(&mut removed, chars);
-                    CharacterSet::Include(removed)
+                Ordering::Equal => {
+                    // [ L ]
+                    // [  R  ]
+                    if left.end < right.end {
+                        intersection.push(left.start..left.end);
+                        right.start = left.end;
+                        self.ranges.remove(left_i);
+                    }
+                    // [ L ]
+                    // [ R ]
+                    else if left.end == right.end {
+                        intersection.push(left.clone());
+                        self.ranges.remove(left_i);
+                        other.ranges.remove(right_i);
+                    }
+                    // [  L  ]
+                    // [ R ]
+                    else if left.end > right.end {
+                        intersection.push(right.clone());
+                        left.start = right.end;
+                        other.ranges.remove(right_i);
+                    }
                 }
-            },
-            CharacterSet::Exclude(chars) => match other {
-                CharacterSet::Include(other_chars) => {
-                    let mut removed = remove_chars(other_chars, chars, false);
-                    add_chars(chars, other_chars);
-                    swap(&mut removed, other_chars);
-                    CharacterSet::Include(removed)
+                Ordering::Greater => {
+                    //     [ L ]
+                    // [ R ]
+                    if left.start >= right.end {
+                        right_i += 1;
+                        continue;
+                    }
+
+                    match left.end.cmp(&right.end) {
+                        //   [ L ]
+                        // [   R   ]
+                        Ordering::Less => {
+                            intersection.push(left.clone());
+                            let new_range = right.start..left.start;
+                            right.start = right.end;
+                            other.ranges.insert(right_i, new_range);
+                            right_i += 1;
+                        }
+
+                        //   [ L ]
+                        // [  R  ]
+                        Ordering::Equal => {
+                            intersection.push(left.clone());
+                            right.end = left.start;
+                            self.ranges.remove(left_i);
+                        }
+
+                        //   [   L   ]
+                        // [   R   ]
+                        Ordering::Greater => {
+                            intersection.push(left.start..right.end);
+                            left.start = right.end;
+                            right.end = left.start;
+                            right_i += 1;
+                        }
+                    }
                 }
-                CharacterSet::Exclude(other_chars) => {
-                    let mut result_exclusion = chars.clone();
-                    result_exclusion.extend(other_chars.iter().cloned());
-                    result_exclusion.sort_unstable();
-                    result_exclusion.dedup();
-                    remove_chars(chars, other_chars, true);
-                    let mut included_characters = Vec::new();
-                    let mut other_included_characters = Vec::new();
-                    swap(&mut included_characters, other_chars);
-                    swap(&mut other_included_characters, chars);
-                    *self = CharacterSet::Include(included_characters);
-                    *other = CharacterSet::Include(other_included_characters);
-                    CharacterSet::Exclude(result_exclusion)
-                }
-            },
+            }
+        }
+        CharacterSet {
+            ranges: intersection,
         }
     }
 
+    pub fn chars<'a>(&'a self) -> impl Iterator<Item = char> + 'a {
+        self.ranges
+            .iter()
+            .flat_map(|r| r.clone().filter_map(char::from_u32))
+    }
+
     pub fn is_empty(&self) -> bool {
-        if let CharacterSet::Include(c) = self {
-            c.is_empty()
-        } else {
-            false
-        }
+        self.ranges.is_empty()
     }
 
     pub fn ranges<'a>(
@@ -216,31 +315,22 @@ impl CharacterSet {
 
     #[cfg(test)]
     pub fn contains(&self, c: char) -> bool {
-        match self {
-            CharacterSet::Include(chars) => chars.contains(&c),
-            CharacterSet::Exclude(chars) => !chars.contains(&c),
-        }
+        self.ranges.iter().any(|r| r.contains(&(c as u32)))
     }
 }
 
 impl Ord for CharacterSet {
     fn cmp(&self, other: &CharacterSet) -> Ordering {
-        match self {
-            CharacterSet::Include(chars) => {
-                if let CharacterSet::Include(other_chars) = other {
-                    order_chars(chars, other_chars)
-                } else {
-                    Ordering::Less
-                }
+        let has_max = self.ranges.last().map_or(false, |r| r.end == u32::MAX);
+        let other_has_max = other.ranges.last().map_or(false, |r| r.end == u32::MAX);
+        if has_max {
+            if !other_has_max {
+                return Ordering::Greater;
             }
-            CharacterSet::Exclude(chars) => {
-                if let CharacterSet::Exclude(other_chars) = other {
-                    order_chars(chars, other_chars)
-                } else {
-                    Ordering::Greater
-                }
-            }
+        } else if other_has_max {
+            return Ordering::Less;
         }
+        self.chars().cmp(other.chars())
     }
 }
 
@@ -624,8 +714,8 @@ mod tests {
             // multiple negated character classes
             (
                 vec![
-                    (CharacterSet::Include(vec!['a']), false, 0, 1),
-                    (CharacterSet::Exclude(vec!['a', 'b', 'c']), false, 0, 2),
+                    (CharacterSet::empty().add_char('a'), false, 0, 1),
+                    (CharacterSet::all().remove_range('a', 'c'), false, 0, 2),
                     (CharacterSet::Include(vec!['g']), false, 0, 6),
                     (CharacterSet::Exclude(vec!['d', 'e', 'f']), false, 0, 3),
                     (CharacterSet::Exclude(vec!['g', 'h', 'i']), false, 0, 4),
